@@ -1,0 +1,11 @@
+{
+  "cases": [
+    [0, 0],
+    [0, 4],
+    [2, 1]
+  ],
+  "_notes": [
+    "Cases may be positional lists, like [4, 2], or objects keyed by parameter name, like {\"a\": 4, \"b\": 2}.",
+    "For raw C literals use {\"$c\": \"UINT_MAX\"}; for bool parameters use true/false."
+  ]
+}
