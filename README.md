@@ -1,6 +1,6 @@
-# C Coverage Checker
+# C Coverage Checkers
 
-Run:
+Control-flow coverage:
 
 ```sh
 python3 coverage_check.py input.c cases.json
@@ -70,3 +70,173 @@ python3 coverage_check.py input.c cases.json --init-cases
   behavior exactly.
 - `--json` prints a machine-readable report.
 - `--keep` leaves the generated instrumented C file in `.coverage_build`.
+
+## Data-Flow Coverage
+
+Run:
+
+```sh
+python3 data_flow_check.py input.c cases.json
+```
+
+The data-flow checker uses the same `input.c` and `cases.json` format. It
+builds a small CFG from the function, runs a reaching-definitions analysis to
+derive def-use obligations, instruments the function, and reports missing
+obligations for:
+
+- all-defs
+- all-c-uses
+- all-p-uses
+- all-p-uses/some-c-uses
+
+The report shows the specific missing data-flow case, for example a definition
+line and the c-use or p-use line/outcome that no supplied input covered.
+
+Useful options:
+
+```sh
+python3 data_flow_check.py input.c cases.json --json
+python3 data_flow_check.py input.c cases.json --keep
+```
+
+### Data-Flow Notes
+
+- Parameters and primitive local variables are tracked by name. Avoid shadowing
+  local variables with the same name in nested scopes.
+- C-uses are ordinary computational expression uses. P-uses are variable
+  occurrences in `if`, `while`, `for`, `do while`, `switch`, and ternary
+  predicates. Boolean p-use outcomes are tracked as false/true.
+- Predicate instrumentation preserves normal C short-circuit evaluation for
+  variable occurrences.
+- The static obligation set is based on may-reach definitions in the CFG, so it
+  can include paths that are structurally possible but semantically infeasible.
+- Pointers, arrays, structs, `break`/`continue`-heavy control flow, and
+  side-effect-heavy predicate expressions are intentionally outside the simple
+  generic model.
+
+## Test Case Suggestions
+
+Run:
+
+```sh
+python3 suggest_tests.py input.c cases.json --criterion mcdc
+```
+
+The suggestion tool reuses the same parser and instrumentation, then generates
+a bounded set of candidate inputs. In `augment` mode, it suggests the minimum
+number of additional cases needed to satisfy the selected criterion over that
+generated candidate set. In `replace` mode, it finds a small replacement suite
+from the generated domain.
+
+Supported criterion values:
+
+```text
+all-defs
+all-c-uses
+all-p-uses
+all-c-uses/some-p-uses
+all-p-uses/some-c-uses
+mcdc
+```
+
+Examples:
+
+```sh
+python3 suggest_tests.py input.c cases.json --criterion all-p-uses
+python3 suggest_tests.py input.c cases.json --criterion all-c-uses --mode replace
+python3 suggest_tests.py input.c cases.json --criterion mcdc --json
+```
+
+The output includes each suggested case as parameter values plus the function
+output for that case, followed by entries that can be pasted into `cases.json`.
+
+### Candidate Domains
+
+By default the script generates small primitive domains such as `0`, `1`, `2`,
+nearby values from the existing cases, and common integer edge-ish values. For
+larger or domain-specific programs, provide a custom domain file:
+
+```json
+{
+  "a": [0, 1, 2, 4, 6, 8],
+  "b": [0, 1, 2, 4, 6, 8]
+}
+```
+
+Then run:
+
+```sh
+python3 suggest_tests.py input.c cases.json --criterion all-p-uses --domain domain.json
+```
+
+Useful knobs:
+
+```sh
+--values-per-param 18
+--max-candidates 5000
+--max-additions 8
+--timeout 10
+```
+
+### Suggestion Limits
+
+This is a bounded generator, not a complete symbolic prover. For data-flow
+criteria it solves an exact set-cover problem when the missing target count is
+small enough; otherwise it reports that the suite is a greedy approximation.
+For MC/DC it searches exact selector pairs over the generated candidate set.
+
+If the script cannot satisfy a criterion, the report lists the still-missing
+obligations and hints whether the likely issue is an infeasible objective, a
+logically coupled MC/DC condition, or a candidate domain that needs more values.
+
+## Strong Mutation Killing
+
+Run:
+
+```sh
+python3 kill_mutant.py original.c mutant.c
+```
+
+Both files must contain exactly one compatible C function: the same primitive
+parameter types in the same order and the same non-void return type. Function
+names do not need to match. The script looks for a strong killing test, meaning
+an input where the original function and mutant function both return, but their
+return values differ.
+
+Example:
+
+```sh
+python3 kill_mutant.py input.c mutant.c
+python3 kill_mutant.py input.c mutant.c --engine bounded
+python3 kill_mutant.py input.c mutant.c --json
+```
+
+The output gives the parameter values, original return value, mutant return
+value, and a `cases.json` entry.
+
+Search engines:
+
+```text
+auto     try CBMC first, then bounded execution
+cbmc     use CBMC only
+bounded  execute generated candidate inputs with GCC
+```
+
+Useful options:
+
+```sh
+--domain domain.json
+--cases cases.json
+--values-per-param 18
+--max-candidates 5000
+--unwind 8
+--timeout 10
+--max-timeouts 25
+```
+
+CBMC mode encodes `original_return == mutant_return` as an assertion and asks
+CBMC for a counterexample over the generated/domain values. Bounded mode
+compiles one harness and runs one candidate per process, so nonterminating
+mutant inputs are skipped after `--timeout`. If no killing case is found, the
+mutant may be equivalent, the predicate change may only cause nontermination,
+or the domain/unwind bound may need to be increased.

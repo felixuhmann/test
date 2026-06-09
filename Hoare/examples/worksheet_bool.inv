@@ -1,0 +1,22 @@
+vars nat i;
+vars bool b;
+
+pre { true }
+
+init {
+  i = 2;
+  b = true;
+}
+
+while (b) {
+  i = i + 1;
+  if (i < 1 || i > 10) {
+    b = false;
+  }
+}
+
+reachable { (b => i <= 10) && i >= 2 && i <= 11 }
+
+candidate { i != 1 }
+candidate { b => i <= 10 }
+candidate { i <= 10 || b }

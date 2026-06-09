@@ -1,0 +1,27 @@
+vars int a, b, x, y, tmp;
+
+pre { true }
+
+init {
+  if (b >= a) {
+    tmp = a;
+    a = b + 1;
+    b = tmp;
+  }
+  if (y >= x) {
+    tmp = x;
+    x = y + 1;
+    y = tmp;
+  }
+}
+
+while (a != b && x != y) {
+  a = a - 1;
+  y = y + 1;
+}
+
+reachable { a >= b && x >= y }
+
+candidate { (b > x) => (a > y) }
+candidate { a >= b && x >= y }
+candidate { a >= y }
