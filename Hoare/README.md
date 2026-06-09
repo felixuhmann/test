@@ -1,150 +1,44 @@
-# Hoare Logic VC Checker
+# Hoare C Annotator
 
-`hoare_solver.py` checks small annotated while-programs. It implements the
-standard assignment, skip, sequence, conditional, while, and consequence-style
-annotation rules by computing weakest preconditions and sending the resulting
-verification conditions to the `z3` command-line solver.
+`annotate_c.py` generates lecture-style Hoare annotations for a small integer C
+subset: local `int` variables, assignments, `if/else`, and one `while` loop.
 
-`invariant_classifier.py` classifies worksheet-style candidate loop invariants
-as:
+It uses:
 
-- `Inductive invariant`
-- `Non-inductive invariant`
-- `Neither`
-- `Unknown` when the available checks are insufficient
+- `pycparser` to parse the C function.
+- Z3, when available, to choose shorter consequence annotations.
 
-Run all included examples:
+Run the square-root example:
 
 ```sh
-python3 Hoare/hoare_solver.py Hoare/examples/*.hl
+python3 Hoare/annotate_c.py Hoare/examples/sqrt.c '{l*l <= n < r*r}' --pre '{n >= 0}'
 ```
 
-Classify the included invariant worksheets:
+Write the result to a file:
 
 ```sh
-python3 Hoare/invariant_classifier.py Hoare/examples/worksheet_*.inv
+python3 Hoare/annotate_c.py Hoare/examples/sqrt.c '{l*l <= n < r*r}' \
+  --pre '{n >= 0}' \
+  --output Hoare/examples/sqrt.annotated.c
 ```
 
-Print the generated rule premises and formulas:
+If `--pre` is omitted, the tool starts with the weakest precondition needed to
+establish the invariant. If `--post` is omitted, it prints the loop-exit
+assertion and, for guards like `l != r - 1`, derives the common final
+substitution step automatically.
 
-```sh
-python3 Hoare/hoare_solver.py --verbose Hoare/examples/sqrt.hl
-```
-
-Print a lecture-style annotated solution:
-
-```sh
-python3 Hoare/hoare_solver.py --annotate Hoare/examples/binary_search.hl
-python3 Hoare/hoare_solver.py --annotate --no-annotation-comments Hoare/examples/binary_search.hl
-```
-
-Input format:
+The assertion parser treats chained comparisons mathematically, so:
 
 ```text
-vars int x, y;
-vars bool b;
-
-pre { x >= 0 }
-
-x = x + 1;
-if (x > y) {
-  y = x;
-} else {
-  skip;
-}
-
-while (x < 10)
-invariant { y >= x }
-{
-  x = x + 1;
-}
-
-post { y >= 0 }
+{l*l <= n < r*r}
 ```
 
-Assertions can be inserted as proof cut-points:
+is parsed as:
 
 ```text
-assert { y >= x };
+{l * l <= n && n < r * r}
 ```
 
-Lecture-style bare assertions are accepted too:
-
-```text
-{ y >= x }
-```
-
-Lecture-style syntax is also supported:
-
-```text
-{0 <= target && target <= n}
-lo := 0
-hi := n
-while lo < hi do
-    mid := (lo + hi) / 2
-    if mid < target then
-        lo := mid + 1
-    else
-        hi := mid
-    fi
-od
-{lo == target}
-```
-
-Loops need invariants. Write them as:
-
-```text
-while x < 10 invariant { y >= x } do
-    x := x + 1
-od
-```
-
-The only missing-invariant heuristic currently built in is the common binary
-search range pattern above, where `while lo < hi` and final `lo == target`
-produce the candidate invariant `lo <= target && target <= hi`.
-
-This is a partial-correctness checker. It proves that the postcondition holds if
-the program terminates; it does not prove loop termination unless you encode a
-separate variant argument yourself.
-
-## Invariant classifier input
-
-The `.inv` format is deliberately close to the worksheet programs:
-
-```text
-vars int a, b;
-vars nat i;
-vars bool flag;
-
-pre { true }
-
-init {
-  a = b + 1;
-}
-
-while (a > 0) {
-  a = a - 1;
-}
-
-reachable { a >= 0 }
-
-candidate { a >= 0 }
-candidate { a != 3 }
-```
-
-`reachable { ... }` is optional. If provided, the classifier first proves that
-the reachable fact is initialized and preserved. It then uses that fact to prove
-that a candidate is an invariant even when the candidate itself is not
-inductive.
-
-Without a reachable fact, the classifier still proves inductive invariants and
-finds many `Neither` cases by symbolic unrolling. It may return `Unknown` for a
-candidate that is initialized but not inductive and has no reachable
-counterexample within the configured unroll bound.
-
-Useful options:
-
-```sh
-python3 Hoare/invariant_classifier.py --unroll 50 Hoare/examples/worksheet_bool.inv
-python3 Hoare/invariant_classifier.py --timeout 2 Hoare/examples/worksheet_mod.inv
-```
+This is a generator for teaching annotations, not a full C verifier. It assumes
+mathematical integer arithmetic for assertions and supports only the C subset
+listed above.
