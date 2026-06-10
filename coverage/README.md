@@ -152,15 +152,20 @@ Supported criterion values:
 all-defs
 all-c-uses
 all-p-uses
+all-uses
 all-c-uses/some-p-uses
 all-p-uses/some-c-uses
 mcdc
 ```
 
+For suggestions, `all-uses` means all c-use obligations plus all p-use
+outcome obligations.
+
 Examples:
 
 ```sh
 python3 suggest_tests.py input.c cases.json --criterion all-p-uses
+python3 suggest_tests.py input.c cases.json --criterion all-uses
 python3 suggest_tests.py input.c cases.json --criterion all-c-uses --mode replace
 python3 suggest_tests.py input.c cases.json --criterion mcdc --json
 ```

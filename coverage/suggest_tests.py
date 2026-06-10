@@ -44,6 +44,7 @@ DATA_FLOW_CRITERIA = {
     "all-defs",
     "all-c-uses",
     "all-p-uses",
+    "all-uses",
     "all-c-uses/some-p-uses",
     "all-p-uses/some-c-uses",
 }
@@ -678,6 +679,12 @@ def data_flow_objective(
 
     if criterion == "all-p-uses":
         return {("P", definition_id, use_id, outcome) for definition_id, use_id, outcome in obligations.p_uses}, [], []
+
+    if criterion == "all-uses":
+        return (
+            {("C", definition_id, use_id) for definition_id, use_id in obligations.c_uses}
+            | {("P", definition_id, use_id, outcome) for definition_id, use_id, outcome in obligations.p_uses}
+        ), [], []
 
     for definition in analysis.defs:
         c_options = c_by_def.get(definition.id, set())

@@ -1,20 +1,9 @@
-void function(int a, int b, int x, int y) {
-    int tmp;
-
-    if (b >= a) {
-        tmp = a;
-        a = b + 1;
-        b = tmp;
-    }
-
-    if (y >= x) {
-        tmp = x;
-        x = y + 1;
-        y = tmp;
-    }
-
-    while (a != b && x != y) {
-        a = a - 1;
-        y = y + 1;
+void function(int x, int y) {
+    int i, j;
+    i = x ;
+    j = y ;
+    while ( i > 1) {
+        i = i / 2;
+        j = j * 2;
     }
 }
