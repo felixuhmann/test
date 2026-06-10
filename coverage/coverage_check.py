@@ -3,8 +3,8 @@
 Dynamic source-line coverage checker for one C function.
 
 The checker parses input.c, instruments the single function, compiles a small
-test harness, runs the provided cases, and reports missing statement, decision,
-condition, and MC/DC coverage objectives.
+test harness, runs the provided cases, and reports missing statement, branch,
+decision, condition, and MC/DC coverage objectives.
 """
 
 from __future__ import annotations
@@ -56,6 +56,15 @@ class ConditionInfo:
 
 
 @dataclass(frozen=True)
+class BranchInfo:
+    id: int
+    decision_id: int
+    line: int
+    outcome: bool
+    label: str
+
+
+@dataclass(frozen=True)
 class DecisionInfo:
     id: int
     line: int
@@ -68,6 +77,7 @@ class CoverageAnalyzer:
         self.line_offset = line_offset
         self.generator = c_generator.CGenerator()
         self.statements: list[StatementInfo] = []
+        self.branches: list[BranchInfo] = []
         self.decisions: list[DecisionInfo] = []
         self.statement_by_node: dict[int, StatementInfo] = {}
         self.decision_by_node: dict[int, DecisionInfo] = {}
@@ -115,6 +125,39 @@ class CoverageAnalyzer:
         )
         self.decisions.append(info)
         self.decision_by_node[id(node)] = info
+        self._add_branch(info, node, True)
+        self._add_branch(info, node, False)
+
+    def _add_branch(self, decision: DecisionInfo, node: c_ast.Node, outcome: bool) -> None:
+        self.branches.append(
+            BranchInfo(
+                id=len(self.branches),
+                decision_id=decision.id,
+                line=decision.line,
+                outcome=outcome,
+                label=self._branch_label(node, outcome),
+            )
+        )
+
+    def _branch_label(self, node: c_ast.Node, outcome: bool) -> str:
+        if isinstance(node, c_ast.If):
+            if outcome:
+                return "then branch"
+            return "else branch" if node.iffalse is not None else "fallthrough branch"
+
+        if isinstance(node, c_ast.While):
+            return "loop body branch" if outcome else "loop exit branch"
+
+        if isinstance(node, c_ast.For):
+            return "loop body branch" if outcome else "loop exit branch"
+
+        if isinstance(node, c_ast.DoWhile):
+            return "repeat branch" if outcome else "loop exit branch"
+
+        if isinstance(node, c_ast.TernaryOp):
+            return "true expression branch" if outcome else "false expression branch"
+
+        return "true branch" if outcome else "false branch"
 
     def _condition_leaves(self, node: c_ast.Node) -> list[c_ast.Node]:
         if isinstance(node, c_ast.BinaryOp) and node.op in ("&&", "||"):
@@ -760,6 +803,11 @@ def line_key(line: int, detail: str) -> tuple[int, str]:
     return (line, detail)
 
 
+def branch_was_seen(branch: BranchInfo, runtime: RuntimeData) -> bool:
+    saw_false, saw_true = runtime.decision_seen.get(branch.decision_id, (False, False))
+    return saw_true if branch.outcome else saw_false
+
+
 def build_report(
     source: str,
     function: c_ast.FuncDef,
@@ -793,6 +841,20 @@ def build_report(
         missing_statement_lines,
         source_lines,
     )
+
+    missing_branches: list[tuple[int, str]] = []
+    for branch in analysis.branches:
+        if branch_was_seen(branch, runtime):
+            continue
+        decision = analysis.decisions[branch.decision_id]
+        outcome = "true" if branch.outcome else "false"
+        missing_branches.append(
+            line_key(
+                branch.line,
+                f"{branch.label} not covered; decision `{decision.expression}` did not evaluate {outcome}",
+            )
+        )
+    append_detail_report(lines, "Branch coverage", missing_branches, source_lines)
 
     missing_decisions: list[tuple[int, str]] = []
     for decision in analysis.decisions:
@@ -893,6 +955,21 @@ def build_json_report(
         if not runtime.statement_seen.get(info.id, False)
     ]
 
+    branch_missing = []
+    for branch in analysis.branches:
+        if branch_was_seen(branch, runtime):
+            continue
+        decision = analysis.decisions[branch.decision_id]
+        branch_missing.append(
+            {
+                "line": branch.line,
+                "source": source_excerpt(source_lines, branch.line),
+                "decision": decision.expression,
+                "branch": branch.label,
+                "outcome": "true" if branch.outcome else "false",
+            }
+        )
+
     decision_missing = []
     for decision in analysis.decisions:
         saw_false, saw_true = runtime.decision_seen.get(decision.id, (False, False))
@@ -943,6 +1020,7 @@ def build_json_report(
         "case_count": len(cases),
         "coverage": {
             "statement": {"covered": not statement_missing, "missing": statement_missing},
+            "branch": {"covered": not branch_missing, "missing": branch_missing},
             "decision": {"covered": not decision_missing, "missing": decision_missing},
             "condition": {"covered": not condition_missing, "missing": condition_missing},
             "mcdc": {"covered": not mcdc_missing, "missing": mcdc_missing},
@@ -969,7 +1047,7 @@ def write_case_template(path: Path, parameters: list[ParameterInfo]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Check statement, decision, condition, and MC/DC coverage for one C function.")
+    parser = argparse.ArgumentParser(description="Check statement, branch, decision, condition, and MC/DC coverage for one C function.")
     parser.add_argument("source", nargs="?", default="input.c", help="C file containing exactly one function. Default: input.c")
     parser.add_argument("cases", nargs="?", default="cases.json", help="JSON file with test cases. Default: cases.json")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of the text report.")

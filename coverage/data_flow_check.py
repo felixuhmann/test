@@ -9,6 +9,7 @@ missing obligations for:
   - all-defs
   - all-c-uses
   - all-p-uses
+  - all-du-pairs
   - all-p-uses/some-c-uses
 """
 
@@ -833,6 +834,12 @@ class DataFlowGenerator(c_generator.CGenerator):
         result += self._make_indent() + f"while ({condition});"
         return result
 
+    def visit_Switch(self, node: c_ast.Switch) -> str:
+        condition = self._switch_expression(node, node.cond)
+        result = f"switch ({condition})\n"
+        result += self._generate_control_body(node.stmt)
+        return result
+
     def visit_TernaryOp(self, node: c_ast.TernaryOp) -> str:
         condition = self._predicate_expression(node, node.cond)
         return f"({condition}) ? ({self._with_mode('c', node.iftrue)}) : ({self._with_mode('c', node.iffalse)})"
@@ -879,6 +886,19 @@ class DataFlowGenerator(c_generator.CGenerator):
             f"int __df_result = !!({condition_text}); "
             f"__df_end_pred({decision.id}, __df_result); "
             "__df_result; })"
+        )
+
+    def _switch_expression(self, node: c_ast.Node, condition: c_ast.Node | None) -> str:
+        decision = self.analysis.decision_by_node.get(id(node))
+        if decision is None or condition is None:
+            return self._with_mode("p", condition) if condition is not None else "0"
+        condition_text = self._with_mode("p", condition)
+        return (
+            "({ "
+            f"__df_begin_pred({decision.id}); "
+            f"__typeof__({condition_text}) __df_switch_value = ({condition_text}); "
+            f"__df_end_pred({decision.id}, !!__df_switch_value); "
+            "__df_switch_value; })"
         )
 
     def _plain_lvalue(self, node: c_ast.Node) -> str:
@@ -1165,6 +1185,8 @@ def build_report(
     missing_p = sorted(obligations.p_uses - runtime.p_uses)
     append_p_use_report(lines, source_lines, "All-p-uses", missing_p, analysis)
 
+    append_du_pair_report(lines, source_lines, "All-du-pairs", missing_c, missing_p, analysis)
+
     missing_mixed = missing_all_p_some_c_obligations(analysis, obligations, runtime)
     append_mixed_report(lines, source_lines, "All-p-uses/some-c-uses", missing_mixed, analysis)
 
@@ -1267,6 +1289,31 @@ def append_p_use_report(
     lines.append("")
 
 
+def append_du_pair_report(
+    lines: list[str],
+    source_lines: list[str],
+    title: str,
+    missing_c: list[tuple[int, int]],
+    missing_p: list[tuple[int, int, int]],
+    analysis: DataFlowAnalyzer,
+) -> None:
+    if not missing_c and not missing_p:
+        lines.append(f"{title}: covered")
+        lines.append("")
+        return
+
+    lines.append(f"{title}: not covered")
+    if missing_c:
+        lines.append("  missing c-use du-pairs:")
+        for definition_id, use_id in missing_c:
+            lines.extend(format_c_obligation(source_lines, analysis, definition_id, use_id, indent="    "))
+    if missing_p:
+        lines.append("  missing p-use du-pairs:")
+        for definition_id, use_id, outcome in missing_p:
+            lines.extend(format_p_obligation(source_lines, analysis, definition_id, use_id, outcome, indent="    "))
+    lines.append("")
+
+
 def append_mixed_report(
     lines: list[str],
     source_lines: list[str],
@@ -1304,13 +1351,14 @@ def format_c_obligation(
     analysis: DataFlowAnalyzer,
     definition_id: int,
     use_id: int,
+    indent: str = "  ",
 ) -> list[str]:
     definition = analysis.defs[definition_id]
     use = analysis.c_uses[use_id]
     return [
-        f"  missing data-flow case: `{definition.var_name}` def -> c-use",
-        format_definition_line(source_lines, definition, indent="    "),
-        format_use_line(source_lines, use, indent="    "),
+        f"{indent}missing data-flow case: `{definition.var_name}` def -> c-use",
+        format_definition_line(source_lines, definition, indent=indent + "  "),
+        format_use_line(source_lines, use, indent=indent + "  "),
     ]
 
 
@@ -1320,13 +1368,14 @@ def format_p_obligation(
     definition_id: int,
     use_id: int,
     outcome: int,
+    indent: str = "  ",
 ) -> list[str]:
     definition = analysis.defs[definition_id]
     use = analysis.p_uses[use_id]
     return [
-        f"  missing data-flow case: `{definition.var_name}` def -> p-use outcome {outcome_name(outcome)}",
-        format_definition_line(source_lines, definition, indent="    "),
-        format_use_line(source_lines, use, indent="    ", outcome=outcome),
+        f"{indent}missing data-flow case: `{definition.var_name}` def -> p-use outcome {outcome_name(outcome)}",
+        format_definition_line(source_lines, definition, indent=indent + "  "),
+        format_use_line(source_lines, use, indent=indent + "  ", outcome=outcome),
     ]
 
 
@@ -1366,6 +1415,13 @@ def build_json_report(
     missing_defs = missing_all_defs_obligations(analysis, obligations, runtime)
     missing_c = sorted(obligations.c_uses - runtime.c_uses)
     missing_p = sorted(obligations.p_uses - runtime.p_uses)
+    missing_du_pairs = [
+        du_c_obligation_to_json(source_lines, analysis, definition_id, use_id)
+        for definition_id, use_id in missing_c
+    ] + [
+        du_p_obligation_to_json(source_lines, analysis, definition_id, use_id, outcome)
+        for definition_id, use_id, outcome in missing_p
+    ]
     missing_mixed = missing_all_p_some_c_obligations(analysis, obligations, runtime)
 
     return {
@@ -1394,6 +1450,10 @@ def build_json_report(
                     p_obligation_to_json(source_lines, analysis, definition_id, use_id, outcome)
                     for definition_id, use_id, outcome in missing_p
                 ],
+            },
+            "all_du_pairs": {
+                "covered": not missing_du_pairs,
+                "missing": missing_du_pairs,
             },
             "all_p_uses_some_c_uses": {
                 "covered": not missing_mixed,
@@ -1453,6 +1513,29 @@ def p_obligation_to_json(
         "definition": definition_to_json(source_lines, analysis.defs[definition_id]),
         "use": use_to_json(source_lines, analysis.p_uses[use_id], outcome=outcome),
     }
+
+
+def du_c_obligation_to_json(
+    source_lines: list[str],
+    analysis: DataFlowAnalyzer,
+    definition_id: int,
+    use_id: int,
+) -> dict[str, Any]:
+    result = c_obligation_to_json(source_lines, analysis, definition_id, use_id)
+    result["kind"] = "c-use"
+    return result
+
+
+def du_p_obligation_to_json(
+    source_lines: list[str],
+    analysis: DataFlowAnalyzer,
+    definition_id: int,
+    use_id: int,
+    outcome: int,
+) -> dict[str, Any]:
+    result = p_obligation_to_json(source_lines, analysis, definition_id, use_id, outcome)
+    result["kind"] = "p-use"
+    return result
 
 
 def mixed_missing_to_json(source_lines: list[str], analysis: DataFlowAnalyzer, detail: dict[str, Any]) -> dict[str, Any]:

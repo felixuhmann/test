@@ -1,7 +1,7 @@
 {
   "cases": [
-    [0],
-    [1]
+    [1,1,2],
+    [2,2,2]
   ],
   "_notes": [
     "Cases may be positional lists, like [4, 2], or objects keyed by parameter name, like {\"a\": 4, \"b\": 2}.",

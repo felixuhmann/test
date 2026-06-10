@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+
+.coverage_build/
+.data_flow_build/
+.suggest_build_dataflow/
+.suggest_build_mcdc/
+.kill_mutant_build/
+.kill_mutant_cbmc/
