@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from test_support import HOARE_SCRIPT, load_hoare, run_cli, write_text
+from test_support import HOARE_SCRIPT, load_hoare, require_z3, run_cli, write_text
 
 
 class HoareAssertionParserTests(unittest.TestCase):
@@ -233,6 +233,29 @@ class HoareRendererAndCliTests(unittest.TestCase):
             output = out_path.read_text(encoding="utf-8")
             self.assertIn("// while rule", output)
             self.assertIn("i = i + 1;", output)
+
+    @unittest.skipUnless(require_z3(), "z3 is required to verify consequence steps")
+    def test_unprovable_consequence_steps_are_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            c_path = write_text(
+                Path(tmp) / "counter.c",
+                """
+                void f(int n) {
+                    int i = 0;
+                    while (i != n) {
+                        i = i + 1;
+                    }
+                }
+                """,
+            )
+
+            bad = run_cli([HOARE_SCRIPT, c_path, "{0 <= i && i <= n}", "--pre", "{n < 0}"])
+            good = run_cli([HOARE_SCRIPT, c_path, "{0 <= i && i <= n}", "--pre", "{n >= 0}"])
+
+        self.assertEqual(bad.returncode, 0, bad.stderr)
+        self.assertIn("WARNING: implication not verified", bad.stdout)
+        self.assertEqual(good.returncode, 0, good.stderr)
+        self.assertNotIn("WARNING", good.stdout)
 
     def test_cli_reports_unknown_assertion_variables(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

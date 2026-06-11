@@ -355,23 +355,21 @@ class InstrumentingGenerator(c_generator.CGenerator):
         leaves = self.analysis._condition_leaves(condition)
         leaf_indexes = {id(leaf): index for index, leaf in enumerate(leaves)}
 
+        # Each leaf is wrapped in place inside the rebuilt expression, so the
+        # generated code keeps C's short-circuit evaluation: conditions the
+        # original program would skip are never evaluated or recorded.
         def rebuilt_expression(expr: c_ast.Node) -> str:
             if isinstance(expr, c_ast.BinaryOp) and expr.op in ("&&", "||"):
                 return f"({rebuilt_expression(expr.left)} {expr.op} {rebuilt_expression(expr.right)})"
-            return f"__cov_d{info.id}_c{leaf_indexes[id(expr)]}"
+            return f"__cov_cond({info.id}, {leaf_indexes[id(expr)]}, !!({self.visit(expr)}))"
 
-        lines: list[str] = ["({ "]
-        for index, leaf in enumerate(leaves):
-            lines.append(f"int __cov_d{info.id}_c{index} = !!({self.visit(leaf)}); ")
-        lines.append(f"int __cov_d{info.id}_result = !!({rebuilt_expression(condition)}); ")
-        values = ", ".join(f"__cov_d{info.id}_c{index}" for index in range(len(leaves)))
-        lines.append(f"int __cov_d{info.id}_values[{max(1, len(leaves))}] = {{{values}}}; ")
-        lines.append(
-            f"__cov_record_decision({info.id}, __cov_d{info.id}_result, "
-            f"{len(leaves)}, __cov_d{info.id}_values); "
+        return (
+            "({ "
+            f"__cov_begin_decision({info.id}); "
+            f"int __cov_d{info.id}_result = !!({rebuilt_expression(condition)}); "
+            f"__cov_end_decision({info.id}, __cov_d{info.id}_result); "
+            f"__cov_d{info.id}_result; }})"
         )
-        lines.append(f"__cov_d{info.id}_result; }})")
-        return "".join(lines)
 
 
 def strip_comments_and_preprocessor(source: str) -> str:
@@ -590,9 +588,12 @@ def generate_runtime_header(statement_count: int, decision_count: int, max_condi
 #define __COV_MAX_CONDITIONS {cond_dim}
 #define __COV_MAX_OBSERVATIONS {max_observations}
 
+#define __COV_COND_UNEVALUATED 2
+
 static unsigned char __cov_stmt_seen[{stmt_dim}];
 static unsigned char __cov_decision_seen[{dec_dim}][2];
 static unsigned char __cov_condition_seen[{dec_dim}][{cond_dim}][2];
+static unsigned char __cov_pending_values[{dec_dim}][{cond_dim}];
 static unsigned char __cov_observation_values[{dec_dim}][__COV_MAX_OBSERVATIONS][{cond_dim}];
 static unsigned char __cov_observation_result[{dec_dim}][__COV_MAX_OBSERVATIONS];
 static int __cov_observation_count[{dec_dim}];
@@ -604,7 +605,26 @@ static void __cov_stmt(int id) {{
     }}
 }}
 
-static void __cov_record_decision(int id, int result, int condition_count, const int *values) {{
+static void __cov_begin_decision(int id) {{
+    int i;
+    if (id < 0 || id >= __COV_DECISIONS) {{
+        return;
+    }}
+    for (i = 0; i < __COV_MAX_CONDITIONS; ++i) {{
+        __cov_pending_values[id][i] = __COV_COND_UNEVALUATED;
+    }}
+}}
+
+static int __cov_cond(int id, int index, int value) {{
+    int normalized = !!value;
+    if (id >= 0 && id < __COV_DECISIONS && index >= 0 && index < __COV_MAX_CONDITIONS) {{
+        __cov_pending_values[id][index] = (unsigned char)normalized;
+        __cov_condition_seen[id][index][normalized] = 1;
+    }}
+    return normalized;
+}}
+
+static void __cov_end_decision(int id, int result) {{
     int normalized_result = !!result;
     int i;
     if (id < 0 || id >= __COV_DECISIONS) {{
@@ -612,9 +632,6 @@ static void __cov_record_decision(int id, int result, int condition_count, const
     }}
 
     __cov_decision_seen[id][normalized_result] = 1;
-    for (i = 0; i < condition_count && i < __COV_MAX_CONDITIONS; ++i) {{
-        __cov_condition_seen[id][i][!!values[i]] = 1;
-    }}
 
     if (__cov_observation_count[id] >= __COV_MAX_OBSERVATIONS) {{
         __cov_observation_overflow[id] = 1;
@@ -622,8 +639,8 @@ static void __cov_record_decision(int id, int result, int condition_count, const
     }}
 
     __cov_observation_result[id][__cov_observation_count[id]] = (unsigned char)normalized_result;
-    for (i = 0; i < condition_count && i < __COV_MAX_CONDITIONS; ++i) {{
-        __cov_observation_values[id][__cov_observation_count[id]][i] = (unsigned char)(!!values[i]);
+    for (i = 0; i < __COV_MAX_CONDITIONS; ++i) {{
+        __cov_observation_values[id][__cov_observation_count[id]][i] = __cov_pending_values[id][i];
     }}
     ++__cov_observation_count[id];
 }}
@@ -643,7 +660,8 @@ static void __cov_dump(void) {{
         for (j = 0; j < __cov_observation_count[i]; ++j) {{
             printf("O %d %d ", i, __cov_observation_result[i][j] ? 1 : 0);
             for (k = 0; k < __COV_MAX_CONDITIONS; ++k) {{
-                putchar(__cov_observation_values[i][j][k] ? '1' : '0');
+                unsigned char value = __cov_observation_values[i][j][k];
+                putchar(value == __COV_COND_UNEVALUATED ? '-' : (value ? '1' : '0'));
             }}
             putchar('\\n');
         }}
@@ -772,6 +790,12 @@ def parse_runtime_output(output: str) -> RuntimeData:
     )
 
 
+def mcdc_bits_compatible(left: str, right: str) -> bool:
+    # '-' marks a condition the short-circuit evaluation skipped; it cannot
+    # have influenced the outcome, so it matches any value on the other side.
+    return left == right or left == "-" or right == "-"
+
+
 def compute_mcdc(decision: DecisionInfo, observations: list[tuple[int, str]]) -> list[bool]:
     covered = [False] * len(decision.conditions)
     for left_index, (left_result, left_bits) in enumerate(observations):
@@ -781,10 +805,12 @@ def compute_mcdc(decision: DecisionInfo, observations: list[tuple[int, str]]) ->
             for condition_index in range(len(decision.conditions)):
                 if covered[condition_index]:
                     continue
-                if left_bits[condition_index] == right_bits[condition_index]:
+                left_bit = left_bits[condition_index]
+                right_bit = right_bits[condition_index]
+                if left_bit not in "01" or right_bit not in "01" or left_bit == right_bit:
                     continue
                 others_same = all(
-                    left_bits[index] == right_bits[index]
+                    mcdc_bits_compatible(left_bits[index], right_bits[index])
                     for index in range(len(decision.conditions))
                     if index != condition_index
                 )

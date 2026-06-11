@@ -83,9 +83,12 @@ class SuggestionUtilityTests(unittest.TestCase):
     def test_mcdc_pair_and_source_selector_helpers(self) -> None:
         left = self.suggest.MCDCObservation(case_id=0, decision_id=0, result=0, bits="10")
         right = self.suggest.MCDCObservation(case_id=1, decision_id=0, result=1, bits="11")
+        short_circuited = self.suggest.MCDCObservation(case_id=2, decision_id=0, result=0, bits="0-")
 
         self.assertTrue(self.suggest.mcdc_pair_covers(1, 2, left, right))
         self.assertFalse(self.suggest.mcdc_pair_covers(0, 2, left, right))
+        self.assertTrue(self.suggest.mcdc_pair_covers(0, 2, short_circuited, right))
+        self.assertFalse(self.suggest.mcdc_pair_covers(1, 2, short_circuited, right))
         self.assertEqual(
             self.suggest.source_selectors({None, 0}, {1}),
             {frozenset({1})},
@@ -192,6 +195,88 @@ class SuggestionCliIntegrationTests(unittest.TestCase):
         self.assertEqual(payload["criterion"], "mcdc")
         self.assertTrue(payload["covered"])
         self.assertGreaterEqual(len(payload["suggested_cases"]), 1)
+
+    def test_crashing_candidates_are_skipped_not_fatal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            c_path = write_text(
+                tmp_path / "div.c",
+                """
+                int d(int x) {
+                    if (100 / x > 5) {
+                        return 1;
+                    }
+                    return 0;
+                }
+                """,
+            )
+            # The generated domain contains x == 0, which crashes with SIGFPE;
+            # that candidate must be dropped instead of aborting the run.
+            cases = write_json(tmp_path / "cases.json", {"cases": [10]})
+
+            result = run_cli(
+                [
+                    SUGGEST_TESTS_SCRIPT,
+                    c_path,
+                    cases,
+                    "--criterion",
+                    "mcdc",
+                    "--json",
+                    "--values-per-param",
+                    "6",
+                    "--max-candidates",
+                    "20",
+                ],
+                timeout=30,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["covered"])
+        self.assertTrue(all(case["inputs"]["x"] != 0 for case in payload["suggested_cases"]))
+
+    def test_nonterminating_candidates_are_skipped_not_fatal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            c_path = write_text(
+                tmp_path / "loop.c",
+                """
+                int sumto(int n) {
+                    int s = 0;
+                    int i = 0;
+                    while (i != n) {
+                        s = s + i;
+                        i = i + 1;
+                    }
+                    return s;
+                }
+                """,
+            )
+            cases = write_json(tmp_path / "cases.json", {"cases": [3]})
+            # n == -1 never terminates; it must time out individually while
+            # the remaining candidates still produce a suggestion.
+            domain = write_json(tmp_path / "domain.json", {"n": [-1, 0, 1, 2, 3, 4]})
+
+            result = run_cli(
+                [
+                    SUGGEST_TESTS_SCRIPT,
+                    c_path,
+                    cases,
+                    "--criterion",
+                    "all-p-uses",
+                    "--json",
+                    "--domain",
+                    domain,
+                    "--timeout",
+                    "1",
+                ],
+                timeout=40,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["covered"])
+        self.assertTrue(all(case["inputs"]["n"] != -1 for case in payload["suggested_cases"]))
 
     def test_all_uses_json_accepts_documented_criterion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

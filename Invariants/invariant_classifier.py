@@ -200,9 +200,9 @@ class Binary(Expr):
         if self.op in {"+", "-", "*", "<", "<=", ">", ">=", "="}:
             return f"({self.op} {left} {right})"
         if self.op == "/":
-            return f"(div {left} {right})"
+            return f"(__c_div {left} {right})"
         if self.op == "%":
-            return f"(mod {left} {right})"
+            return f"(__c_mod {left} {right})"
         if self.op == "&&":
             return f"(and {left} {right})"
         if self.op == "||":
@@ -829,6 +829,20 @@ def symbolic_stmt(stmt: Stmt, state: dict[str, Expr], variables: list[str]) -> d
     raise InvariantError(f"unsupported symbolic statement {stmt!r}")
 
 
+# SMT-LIB div/mod are Euclidean (the remainder is never negative), but C
+# truncates the quotient toward zero, so the two disagree whenever an operand
+# is negative: in C  -7 / 2 == -3  and  -7 % 2 == -1, while in SMT-LIB
+# (div (- 7) 2) == -4 and (mod (- 7) 2) == 1. These wrappers encode the C
+# semantics so candidates over / and % are judged against the C program.
+SMT_PRELUDE = """\
+(define-fun __c_div ((a Int) (b Int)) Int
+  (ite (or (and (>= a 0) (> b 0)) (and (<= a 0) (< b 0)))
+       (div (abs a) (abs b))
+       (- (div (abs a) (abs b)))))
+(define-fun __c_mod ((a Int) (b Int)) Int
+  (- a (* b (__c_div a b))))"""
+
+
 def smt_types(types: dict[str, str]) -> dict[str, str]:
     return {name: ("Int" if typ == "Nat" else typ) for name, typ in types.items()}
 
@@ -905,6 +919,7 @@ def check_valid(expr: Expr, types: dict[str, str], z3_path: str, timeout: float)
         part
         for part in [
             "(set-option :produce-models true)",
+            SMT_PRELUDE,
             declarations_smt(types),
             f"(assert (not {expr.to_smt()}))",
             "(check-sat)",
@@ -1005,6 +1020,7 @@ def check_sat_smt_with_values(
         part
         for part in [
             "(set-option :produce-models true)",
+            SMT_PRELUDE,
             declarations_smt(types),
             *(extra_declarations or []),
             f"(assert {condition_smt})",

@@ -226,8 +226,15 @@ The generator uses standard Hoare-logic rules:
   or weakening.
 
 The tool does not prove that the invariant is correct in a fully general way.
-It generates the annotated proof skeleton and uses Z3 only for small implication
-checks that improve readability.
+It generates the annotated proof skeleton and uses Z3 for small implication
+checks that improve readability. When Z3 is available and a consequence step
+cannot be proven, the step is still printed but its comment is marked with
+`(WARNING: implication not verified)`; check such steps by hand before relying
+on the proof outline. With `--no-z3` (or without Z3 installed) no consequence
+step is verified.
+
+Division and modulo in assertions are interpreted with C truncation semantics
+(`-7 / 2 == -3`, `-7 % 2 == -1`), matching the program being annotated.
 
 ## Troubleshooting
 

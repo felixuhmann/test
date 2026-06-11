@@ -240,6 +240,49 @@ class InvariantZ3ClassificationTests(unittest.TestCase):
         self.assertEqual(classifications[1].kind, "Not an invariant")
         self.assertIn("reachable loop-head state", classifications[1].reason)
 
+    def test_modulo_and_division_use_c_truncation_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            c_path = write_text(
+                Path(tmp) / "negmod.c",
+                """
+                void f(int x) {
+                    int y = -7;
+                    while (x > 0) {
+                        x = x - 1;
+                    }
+                }
+                """,
+            )
+            # In C, -7 % 2 == -1 (truncated); SMT-LIB mod would give 1.
+            formula_path = write_text(
+                Path(tmp) / "formulas.txt",
+                """
+                candidate { y % 2 == 1 }
+                candidate { y % 2 == -1 }
+                candidate { y / 2 == -3 }
+                """,
+            )
+            problem = self.inv.parse_c_problem(c_path)
+            formula_input = self.inv.parse_formula_file(formula_path)
+            output_variables = self.inv.displayed_variables(problem, formula_input)
+
+            classifications = [
+                self.inv.classify_candidate(
+                    problem,
+                    formula_input,
+                    candidate,
+                    output_variables,
+                    unroll=2,
+                    z3_path="z3",
+                    timeout=5.0,
+                )
+                for candidate in formula_input.candidates
+            ]
+
+        self.assertEqual(classifications[0].kind, "Not an invariant")
+        self.assertEqual(classifications[1].kind, "Inductive invariant")
+        self.assertEqual(classifications[2].kind, "Inductive invariant")
+
     def test_cli_prints_multiple_classifications(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             c_path = write_text(

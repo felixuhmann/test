@@ -108,9 +108,9 @@ class Binary(Expr):
         if self.op in {"+", "-", "*", "<", "<=", ">", ">="}:
             return f"({self.op} {left} {right})"
         if self.op == "/":
-            return f"(div {left} {right})"
+            return f"(__c_div {left} {right})"
         if self.op == "%":
-            return f"(mod {left} {right})"
+            return f"(__c_mod {left} {right})"
         if self.op == "&&":
             return f"(and {left} {right})"
         if self.op == "||":
@@ -128,6 +128,17 @@ def smt_name(name: str) -> str:
     if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
         return name
     return "|" + name.replace("|", "||") + "|"
+
+
+# SMT-LIB div/mod are Euclidean, C truncates toward zero; the wrappers encode
+# C semantics so Z3 judges assertions against what the C program computes.
+SMT_PRELUDE = """\
+(define-fun __c_div ((a Int) (b Int)) Int
+  (ite (or (and (>= a 0) (> b 0)) (and (<= a 0) (< b 0)))
+       (div (abs a) (abs b))
+       (- (div (abs a) (abs b)))))
+(define-fun __c_mod ((a Int) (b Int)) Int
+  (- a (* b (__c_div a b))))"""
 
 
 def mk_and(parts: Iterable[Expr]) -> Expr:
@@ -612,6 +623,7 @@ class Checker:
         script = "\n".join(
             part
             for part in [
+                SMT_PRELUDE,
                 declarations,
                 f"(assert (not {expr.to_smt()}))",
                 "(check-sat)",
@@ -737,8 +749,11 @@ class Renderer:
         self.append_consequence(lines, indent, loop_exit, post)
 
     def append_consequence(self, lines: list[str], indent: int, current: Expr, target: Expr) -> None:
+        rule = "consequence rule"
+        if self.checker is not None and self.checker.enabled and not self.checker.proves(current, target):
+            rule = "consequence rule (WARNING: implication not verified)"
         for step in consequence_steps(current, target):
-            append_assertion(lines, indent, step, "consequence rule")
+            append_assertion(lines, indent, step, rule)
 
 
 def append_assertion(lines: list[str], indent: int, expr: Expr, rule: str | None) -> None:

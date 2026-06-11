@@ -16,6 +16,7 @@ import math
 import random
 import shutil
 import subprocess
+import sys
 import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
@@ -33,6 +34,7 @@ from coverage_check import (
     function_name,
     function_parameters,
     load_cases,
+    mcdc_bits_compatible,
     normalize_type_name,
     parse_c_file,
     value_to_c_literal,
@@ -145,7 +147,7 @@ def case_to_c_args(case: list[Any], parameters: list[Any]) -> str:
     return ", ".join(args)
 
 
-def compile_and_run(source: str, build_dir: Path, stem: str, timeout: float) -> str:
+def compile_source(source: str, build_dir: Path, stem: str) -> Path:
     generated_c = build_dir / f"{stem}.c"
     binary = build_dir / stem
     generated_c.write_text(source, encoding="utf-8")
@@ -167,29 +169,73 @@ def compile_and_run(source: str, build_dir: Path, stem: str, timeout: float) -> 
             f"Command: {' '.join(compile_cmd)}\n"
             f"{compile_result.stderr}"
         )
-
-    try:
-        run_result = subprocess.run([str(binary)], text=True, capture_output=True, timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        raise SystemExit(f"Instrumented program timed out after {timeout} seconds.") from exc
-
-    if run_result.returncode != 0:
-        raise SystemExit(
-            "Instrumented program exited with a non-zero status.\n"
-            f"stdout:\n{run_result.stdout}\n"
-            f"stderr:\n{run_result.stderr}"
-        )
-    return run_result.stdout
+    return binary
 
 
-def generate_data_flow_runtime(var_count: int, p_use_count: int) -> str:
+def generate_indexed_main(start_case_call: str, case_bodies: list[list[str]], prelude_calls: list[str]) -> str:
+    # One case per process invocation: a candidate input that crashes or does
+    # not terminate is skipped instead of aborting the whole evaluation.
+    lines = ["int main(int argc, char **argv) {"]
+    for call in prelude_calls:
+        lines.append(f"    {call}")
+    lines.append("    int __suggest_case_index = argc > 1 ? atoi(argv[1]) : 0;")
+    lines.append("    switch (__suggest_case_index) {")
+    for index, body in enumerate(case_bodies):
+        lines.append(f"    case {index}: {{")
+        lines.append(f"        {start_case_call}({index});")
+        lines.extend(f"    {line}" for line in body)
+        lines.append("        break;")
+        lines.append("    }")
+    lines.extend(
+        [
+            "    default:",
+            "        return 2;",
+            "    }",
+            "    return 0;",
+            "}",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def run_indexed_cases(binary: Path, case_count: int, timeout: float, max_timeouts: int) -> dict[int, str]:
+    outputs: dict[int, str] = {}
+    timeout_count = 0
+    for index in range(case_count):
+        try:
+            run_result = subprocess.run(
+                [str(binary), str(index)],
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            timeout_count += 1
+            if timeout_count >= max_timeouts:
+                print(
+                    f"warning: stopped executing candidates after {timeout_count} timed-out case(s); "
+                    "remaining candidates are treated as exercising nothing",
+                    file=sys.stderr,
+                )
+                break
+            continue
+        if run_result.returncode != 0:
+            continue
+        outputs[index] = run_result.stdout
+    return outputs
+
+
+def generate_data_flow_runtime(var_count: int, p_use_count: int, p_use_decisions: list[int]) -> str:
     var_dim = max(1, var_count)
     p_dim = max(1, p_use_count)
+    decision_table = data_flow_check.p_use_decision_table(p_use_decisions)
     return f"""\
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <limits.h>
 #include <float.h>
 
@@ -199,6 +245,7 @@ def generate_data_flow_runtime(var_count: int, p_use_count: int) -> str:
 static int __df_current_def[{var_dim}];
 static unsigned char __df_p_touched[{p_dim}];
 static int __df_p_touched_def[{p_dim}];
+static const int __df_p_use_decision[{p_dim}] = {{{decision_table}}};
 static int __df_current_case = -1;
 
 static void __df_init_once(void) {{
@@ -235,8 +282,10 @@ static void __df_record_cuse(int use_id, int var_id) {{
 
 static void __df_begin_pred(int decision_id) {{
     int i;
-    (void)decision_id;
     for (i = 0; i < __DF_P_USE_COUNT; ++i) {{
+        if (__df_p_use_decision[i] != decision_id) {{
+            continue;
+        }}
         __df_p_touched[i] = 0;
         __df_p_touched_def[i] = -1;
     }}
@@ -258,12 +307,15 @@ static void __df_touch_puse(int use_id, int var_id) {{
 static void __df_end_pred(int decision_id, int result) {{
     int i;
     int outcome = !!result;
-    (void)decision_id;
     for (i = 0; i < __DF_P_USE_COUNT; ++i) {{
         int def_id;
+        if (__df_p_use_decision[i] != decision_id) {{
+            continue;
+        }}
         if (!__df_p_touched[i]) {{
             continue;
         }}
+        __df_p_touched[i] = 0;
         def_id = __df_p_touched_def[i];
         if (def_id < 0) {{
             continue;
@@ -280,17 +332,20 @@ def generate_data_flow_harness(
     parameters: list[Any],
     cases: list[list[Any]],
 ) -> str:
-    runtime = generate_data_flow_runtime(len(analysis.variables), len(analysis.p_uses))
+    runtime = generate_data_flow_runtime(
+        len(analysis.variables),
+        len(analysis.p_uses),
+        data_flow_check.p_use_decisions(analysis),
+    )
     instrumented_function = data_flow_check.DataFlowGenerator(analysis).visit(function)
     return_type = function_return_type(function)
     name = function_name(function)
-    main_lines = ["int main(void) {", "    __df_init_once();"]
-    for index, case in enumerate(cases):
-        args = case_to_c_args(case, parameters)
-        main_lines.append(f"    __df_start_case({index});")
-        main_lines.extend(result_capture_lines(return_type, name, args, index))
-    main_lines.extend(["    return 0;", "}", ""])
-    return runtime + "\n" + instrumented_function + "\n" + "\n".join(main_lines)
+    case_bodies = [
+        result_capture_lines(return_type, name, case_to_c_args(case, parameters), index)
+        for index, case in enumerate(cases)
+    ]
+    main = generate_indexed_main("__df_start_case", case_bodies, ["__df_init_once();"])
+    return runtime + "\n" + instrumented_function + "\n" + main
 
 
 def parse_data_flow_candidate_output(output: str) -> tuple[dict[int, set[tuple[Any, ...]]], dict[int, str]]:
@@ -315,19 +370,23 @@ def parse_data_flow_candidate_output(output: str) -> tuple[dict[int, set[tuple[A
 
 
 def generate_mcdc_runtime(decision_count: int, max_conditions: int) -> str:
+    dec_dim = max(1, decision_count)
     cond_dim = max(1, max_conditions)
     return f"""\
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <limits.h>
 #include <float.h>
 
 #define __COV_DECISIONS {decision_count}
 #define __COV_MAX_CONDITIONS {cond_dim}
+#define __COV_COND_UNEVALUATED 2
 
 static int __suggest_current_case = -1;
+static unsigned char __cov_pending_values[{dec_dim}][{cond_dim}];
 
 static void __cov_stmt(int id) {{
     (void)id;
@@ -337,11 +396,33 @@ static void __suggest_start_case(int case_index) {{
     __suggest_current_case = case_index;
 }}
 
-static void __cov_record_decision(int id, int result, int condition_count, const int *values) {{
+static void __cov_begin_decision(int id) {{
     int i;
+    if (id < 0 || id >= __COV_DECISIONS) {{
+        return;
+    }}
+    for (i = 0; i < __COV_MAX_CONDITIONS; ++i) {{
+        __cov_pending_values[id][i] = __COV_COND_UNEVALUATED;
+    }}
+}}
+
+static int __cov_cond(int id, int index, int value) {{
+    int normalized = !!value;
+    if (id >= 0 && id < __COV_DECISIONS && index >= 0 && index < __COV_MAX_CONDITIONS) {{
+        __cov_pending_values[id][index] = (unsigned char)normalized;
+    }}
+    return normalized;
+}}
+
+static void __cov_end_decision(int id, int result) {{
+    int i;
+    if (id < 0 || id >= __COV_DECISIONS) {{
+        return;
+    }}
     printf("O %d %d %d ", __suggest_current_case, id, !!result);
-    for (i = 0; i < condition_count && i < __COV_MAX_CONDITIONS; ++i) {{
-        putchar(values[i] ? '1' : '0');
+    for (i = 0; i < __COV_MAX_CONDITIONS; ++i) {{
+        unsigned char value = __cov_pending_values[id][i];
+        putchar(value == __COV_COND_UNEVALUATED ? '-' : (value ? '1' : '0'));
     }}
     putchar('\\n');
 }}
@@ -359,13 +440,12 @@ def generate_mcdc_harness(
     instrumented_function = InstrumentingGenerator(analysis).visit(function)
     return_type = function_return_type(function)
     name = function_name(function)
-    main_lines = ["int main(void) {"]
-    for index, case in enumerate(cases):
-        args = case_to_c_args(case, parameters)
-        main_lines.append(f"    __suggest_start_case({index});")
-        main_lines.extend(result_capture_lines(return_type, name, args, index))
-    main_lines.extend(["    return 0;", "}", ""])
-    return runtime + "\n" + instrumented_function + "\n" + "\n".join(main_lines)
+    case_bodies = [
+        result_capture_lines(return_type, name, case_to_c_args(case, parameters), index)
+        for index, case in enumerate(cases)
+    ]
+    main = generate_indexed_main("__suggest_start_case", case_bodies, [])
+    return runtime + "\n" + instrumented_function + "\n" + main
 
 
 def parse_mcdc_candidate_output(output: str) -> tuple[dict[int, list[MCDCObservation]], dict[int, str]]:
@@ -562,6 +642,7 @@ def evaluate_data_flow_candidates(
     candidate_cases: list[list[Any]],
     timeout: float,
     keep: bool,
+    max_timeouts: int,
 ) -> tuple[DataFlowAnalyzer, StaticObligations, set[tuple[Any, ...]], list[Candidate], Path | None]:
     analysis = DataFlowAnalyzer(function, parameters, PARSER_PREFIX_LINES)
     obligations = analysis.analyze()
@@ -573,14 +654,16 @@ def evaluate_data_flow_candidates(
         if build_dir.exists():
             shutil.rmtree(build_dir)
         build_dir.mkdir(parents=True)
-        output = compile_and_run(harness, build_dir, "suggest_dataflow", timeout)
+        binary = compile_source(harness, build_dir, "suggest_dataflow")
+        outputs = run_indexed_cases(binary, len(all_cases), timeout, max_timeouts)
         kept_dir: Path | None = build_dir
     else:
         with tempfile.TemporaryDirectory(prefix="suggest_dataflow_") as tmp:
-            output = compile_and_run(harness, Path(tmp), "suggest_dataflow", timeout)
+            binary = compile_source(harness, Path(tmp), "suggest_dataflow")
+            outputs = run_indexed_cases(binary, len(all_cases), timeout, max_timeouts)
         kept_dir = None
 
-    feature_by_case, output_by_case = parse_data_flow_candidate_output(output)
+    feature_by_case, output_by_case = parse_data_flow_candidate_output("\n".join(outputs.values()))
     current_features: set[tuple[Any, ...]] = set()
     for index in range(len(current_cases)):
         current_features.update(feature_by_case.get(index, set()))
@@ -607,6 +690,7 @@ def evaluate_mcdc_candidates(
     candidate_cases: list[list[Any]],
     timeout: float,
     keep: bool,
+    max_timeouts: int,
 ) -> tuple[CoverageAnalyzer, list[MCDCObservation], list[Candidate], Path | None]:
     analysis = CoverageAnalyzer(line_offset=PARSER_PREFIX_LINES)
     analysis.analyze_function(function)
@@ -618,14 +702,16 @@ def evaluate_mcdc_candidates(
         if build_dir.exists():
             shutil.rmtree(build_dir)
         build_dir.mkdir(parents=True)
-        output = compile_and_run(harness, build_dir, "suggest_mcdc", timeout)
+        binary = compile_source(harness, build_dir, "suggest_mcdc")
+        outputs = run_indexed_cases(binary, len(all_cases), timeout, max_timeouts)
         kept_dir: Path | None = build_dir
     else:
         with tempfile.TemporaryDirectory(prefix="suggest_mcdc_") as tmp:
-            output = compile_and_run(harness, Path(tmp), "suggest_mcdc", timeout)
+            binary = compile_source(harness, Path(tmp), "suggest_mcdc")
+            outputs = run_indexed_cases(binary, len(all_cases), timeout, max_timeouts)
         kept_dir = None
 
-    observations_by_case, output_by_case = parse_mcdc_candidate_output(output)
+    observations_by_case, output_by_case = parse_mcdc_candidate_output("\n".join(outputs.values()))
     current_observations: list[MCDCObservation] = []
     for index in range(len(current_cases)):
         current_observations.extend(
@@ -959,10 +1045,12 @@ def mcdc_pair_covers(condition_id: int, condition_count: int, left: MCDCObservat
         return False
     if len(left.bits) < condition_count or len(right.bits) < condition_count:
         return False
-    if left.bits[condition_id] == right.bits[condition_id]:
+    left_bit = left.bits[condition_id]
+    right_bit = right.bits[condition_id]
+    if left_bit not in "01" or right_bit not in "01" or left_bit == right_bit:
         return False
     return all(
-        left.bits[index] == right.bits[index]
+        mcdc_bits_compatible(left.bits[index], right.bits[index])
         for index in range(condition_count)
         if index != condition_id
     )
@@ -1193,7 +1281,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-search-nodes", type=int, default=250000, help="Maximum MC/DC recursive search nodes.")
     parser.add_argument("--exact-target-limit", type=int, default=32, help="Use exact set cover up to this many missing data-flow targets.")
     parser.add_argument("--seed", type=int, default=1, help="Random seed used when candidate sampling is needed.")
-    parser.add_argument("--timeout", type=float, default=10.0, help="Timeout in seconds for the instrumented program.")
+    parser.add_argument("--timeout", type=float, default=10.0, help="Timeout in seconds per executed candidate case.")
+    parser.add_argument("--max-timeouts", type=int, default=25, help="Stop executing candidates after this many timed-out cases.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     parser.add_argument("--keep", action="store_true", help="Keep the generated instrumented harness.")
     args = parser.parse_args(argv)
@@ -1220,6 +1309,7 @@ def main(argv: list[str] | None = None) -> int:
             candidate_cases=candidate_cases,
             timeout=args.timeout,
             keep=args.keep,
+            max_timeouts=max(1, args.max_timeouts),
         )
         result = solve_data_flow(
             criterion=args.criterion,
@@ -1237,6 +1327,7 @@ def main(argv: list[str] | None = None) -> int:
             candidate_cases=candidate_cases,
             timeout=args.timeout,
             keep=args.keep,
+            max_timeouts=max(1, args.max_timeouts),
         )
         result = solve_mcdc(
             analysis=analysis,

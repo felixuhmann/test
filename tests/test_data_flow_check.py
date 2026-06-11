@@ -158,6 +158,90 @@ class DataFlowCliIntegrationTests(unittest.TestCase):
         self.assertIn("All-p-uses: not covered", result.stdout)
         self.assertIn("outcome false", result.stdout)
 
+    def test_nested_ternary_predicate_does_not_fake_p_use_outcomes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            c_path = write_text(
+                tmp_path / "tern.c",
+                """
+                int f(int a, int b) {
+                    if (a > 0 ? b > 0 : 0) {
+                        return 1;
+                    }
+                    return 0;
+                }
+                """,
+            )
+            # a > 0 evaluates only to true here; the enclosing if is false. The
+            # false outcome of the ternary p-use must stay missing instead of
+            # being recorded with the outer decision's outcome.
+            cases = write_json(tmp_path / "cases.json", {"cases": [[1, 0]]})
+
+            result = run_cli([DATA_FLOW_SCRIPT, c_path, cases, "--json"], timeout=20)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        missing_p = report["coverage"]["all_p_uses"]["missing"]
+        self.assertTrue(
+            any(
+                item["use"]["expression"] == "a in a > 0" and item["use"]["outcome"] == "false"
+                for item in missing_p
+            ),
+            missing_p,
+        )
+
+    def test_assignment_inside_condition_records_definition(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            c_path = write_text(
+                tmp_path / "asg.c",
+                """
+                int g(int x) {
+                    int y = 0;
+                    if ((y = x + 1) > 0) {
+                        return y;
+                    }
+                    return 0;
+                }
+                """,
+            )
+            cases = write_json(tmp_path / "cases.json", {"cases": [0, -5]})
+
+            result = run_cli([DATA_FLOW_SCRIPT, c_path, cases, "--json"], timeout=20)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertTrue(report["coverage"]["all_c_uses"]["covered"], report["coverage"]["all_c_uses"])
+
+    def test_switch_models_direct_case_entry_and_no_default_fallthrough(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            c_path = write_text(
+                tmp_path / "sw.c",
+                """
+                int s(int x) {
+                    int r = 0;
+                    switch (x) {
+                    case 1:
+                        r = 10;
+                    case 2:
+                        r = r + x;
+                    }
+                    return r;
+                }
+                """,
+            )
+            # x == 2 jumps straight to case 2, so `int r = 0` reaches the
+            # c-use in `r + x` without passing through case 1.
+            cases = write_json(tmp_path / "cases.json", {"cases": [1, 2, 0]})
+
+            result = run_cli([DATA_FLOW_SCRIPT, c_path, cases, "--json"], timeout=20)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        for criterion in ["all_defs", "all_c_uses", "all_p_uses", "all_du_pairs", "all_p_uses_some_c_uses"]:
+            self.assertTrue(report["coverage"][criterion]["covered"], criterion)
+
     def test_json_report_keeps_source_line_excerpts_for_missing_obligations(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

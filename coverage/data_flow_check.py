@@ -423,8 +423,8 @@ class DataFlowAnalyzer:
             decision = self._new_decision(node, node.cond)
             condition_events = [self._new_point(decision.line, f"switch `{decision.expression}`")]
             condition_events += self._expr_events(node.cond, mode="p", decision_id=decision.id)
-            exits = self._append_events(previous, condition_events)
-            return self._build_statement(node.stmt, exits)
+            condition_exits = self._append_events(previous, condition_events)
+            return self._build_switch_body(node.stmt, condition_exits)
 
         if isinstance(node, c_ast.Case):
             exits = self._append_events(previous, self._expr_events(node.expr, mode="c"))
@@ -443,6 +443,26 @@ class DataFlowAnalyzer:
             return []
 
         return self._append_events(previous, self._expr_events(node, mode="c"))
+
+    def _build_switch_body(self, body: c_ast.Node | None, condition_exits: list[int]) -> list[int]:
+        # Every case label is directly reachable from the switch condition, in
+        # addition to fallthrough from the previous case. Without a default
+        # label, the body can also be skipped entirely.
+        if body is None:
+            return condition_exits
+        items = body.block_items or [] if isinstance(body, c_ast.Compound) else [body]
+        fallthrough: list[int] = []
+        has_default = False
+        for item in items:
+            if isinstance(item, (c_ast.Case, c_ast.Default)):
+                if isinstance(item, c_ast.Default):
+                    has_default = True
+                fallthrough = self._build_statement(item, fallthrough + condition_exits)
+            else:
+                fallthrough = self._build_statement(item, fallthrough)
+        if has_default:
+            return fallthrough
+        return fallthrough + condition_exits
 
     def _decl_events(self, node: c_ast.Decl) -> list[int]:
         events: list[int] = []
@@ -697,29 +717,9 @@ class DataFlowGenerator(c_generator.CGenerator):
                 result += indent + self._def_call(definition) + ";\n"
             return result
 
-        if isinstance(node, c_ast.Assignment):
-            definition = self.analysis.def_by_assignment_node.get(id(node))
-            lvalue_use = self.analysis.compound_lvalue_use_by_assignment_node.get(id(node))
-            result = ""
-            if lvalue_use is not None:
-                result += indent + self._c_use_call(lvalue_use) + ";\n"
-            result += indent + self.visit(node) + ";\n"
-            if definition is not None:
-                result += indent + self._def_call(definition) + ";\n"
-            return result
-
-        if isinstance(node, c_ast.UnaryOp) and node.op in ("++", "--", "p++", "p--"):
-            use = self.analysis.unary_use_by_node.get(id(node))
-            definition = self.analysis.def_by_unary_node.get(id(node))
-            result = ""
-            if use is not None:
-                result += indent + self._c_use_call(use) + ";\n"
-            result += indent + self.visit(node) + ";\n"
-            if definition is not None:
-                result += indent + self._def_call(definition) + ";\n"
-            return result
-
         if typ in (
+            c_ast.Assignment,
+            c_ast.UnaryOp,
             c_ast.Cast,
             c_ast.BinaryOp,
             c_ast.TernaryOp,
@@ -757,7 +757,20 @@ class DataFlowGenerator(c_generator.CGenerator):
 
     def visit_Assignment(self, node: c_ast.Assignment) -> str:
         rval = self._with_mode("c", node.rvalue)
-        return f"{self._plain_lvalue(node.lvalue)} {node.op} {rval}"
+        lvalue = self._plain_lvalue(node.lvalue)
+        assignment = f"{lvalue} {node.op} {rval}"
+        definition = self.analysis.def_by_assignment_node.get(id(node))
+        lvalue_use = self.analysis.compound_lvalue_use_by_assignment_node.get(id(node))
+        if definition is None and lvalue_use is None:
+            return assignment
+        parts = ["({ "]
+        if lvalue_use is not None:
+            parts.append(f"{self._c_use_call(lvalue_use)}; ")
+        parts.append(f"__typeof__({lvalue}) __df_assigned = ({assignment}); ")
+        if definition is not None:
+            parts.append(f"{self._def_call(definition)}; ")
+        parts.append("__df_assigned; })")
+        return "".join(parts)
 
     def visit_UnaryOp(self, node: c_ast.UnaryOp) -> str:
         if node.op not in ("++", "--", "p++", "p--"):
@@ -919,11 +932,23 @@ class DataFlowGenerator(c_generator.CGenerator):
         return f"__df_touch_puse({use.id}, {use.var_id})"
 
 
-def generate_runtime_header(var_count: int, def_count: int, c_use_count: int, p_use_count: int) -> str:
+def p_use_decision_table(p_use_decisions: list[int]) -> str:
+    entries = ", ".join(str(decision_id) for decision_id in p_use_decisions) or "-1"
+    return entries
+
+
+def generate_runtime_header(
+    var_count: int,
+    def_count: int,
+    c_use_count: int,
+    p_use_count: int,
+    p_use_decisions: list[int],
+) -> str:
     var_dim = max(1, var_count)
     def_dim = max(1, def_count)
     c_dim = max(1, c_use_count)
     p_dim = max(1, p_use_count)
+    decision_table = p_use_decision_table(p_use_decisions)
     return f"""\
 #include <stdbool.h>
 #include <stddef.h>
@@ -944,6 +969,7 @@ static unsigned char __df_p_seen[{def_dim}][{p_dim}][2];
 static int __df_p_case[{def_dim}][{p_dim}][2];
 static unsigned char __df_p_touched[{p_dim}];
 static int __df_p_touched_def[{p_dim}];
+static const int __df_p_use_decision[{p_dim}] = {{{decision_table}}};
 static int __df_current_case = -1;
 
 static void __df_init_once(void) {{
@@ -996,8 +1022,10 @@ static void __df_record_cuse(int use_id, int var_id) {{
 
 static void __df_begin_pred(int decision_id) {{
     int i;
-    (void)decision_id;
     for (i = 0; i < __DF_P_USE_COUNT; ++i) {{
+        if (__df_p_use_decision[i] != decision_id) {{
+            continue;
+        }}
         __df_p_touched[i] = 0;
         __df_p_touched_def[i] = -1;
     }}
@@ -1019,12 +1047,15 @@ static void __df_touch_puse(int use_id, int var_id) {{
 static void __df_end_pred(int decision_id, int result) {{
     int i;
     int outcome = !!result;
-    (void)decision_id;
     for (i = 0; i < __DF_P_USE_COUNT; ++i) {{
         int def_id;
+        if (__df_p_use_decision[i] != decision_id) {{
+            continue;
+        }}
         if (!__df_p_touched[i]) {{
             continue;
         }}
+        __df_p_touched[i] = 0;
         def_id = __df_p_touched_def[i];
         if (def_id < 0 || def_id >= __DF_DEF_COUNT) {{
             continue;
@@ -1058,6 +1089,10 @@ static void __df_dump(void) {{
 """
 
 
+def p_use_decisions(analysis: DataFlowAnalyzer) -> list[int]:
+    return [use.decision_id if use.decision_id is not None else -1 for use in analysis.p_uses]
+
+
 def generate_harness(
     function: c_ast.FuncDef,
     analysis: DataFlowAnalyzer,
@@ -1069,6 +1104,7 @@ def generate_harness(
         def_count=len(analysis.defs),
         c_use_count=len(analysis.c_uses),
         p_use_count=len(analysis.p_uses),
+        p_use_decisions=p_use_decisions(analysis),
     )
     instrumented_function = DataFlowGenerator(analysis).visit(function)
     calls = ["    __df_init_once();"]
@@ -1199,15 +1235,13 @@ def missing_all_defs_obligations(
     obligations: StaticObligations,
     runtime: RuntimeData,
 ) -> list[int]:
+    # Runtime observations decide coverage: defs the static CFG considers
+    # use-free stay missing because nothing can ever cover them, while a def
+    # whose def-clear use was actually observed counts even if the static
+    # obligation set under-approximated.
     covered_defs = {definition_id for definition_id, _ in runtime.c_uses}
     covered_defs.update(definition_id for definition_id, _, _ in runtime.p_uses)
-    missing = []
-    for definition in analysis.defs:
-        if definition.id in obligations.defs_with_no_reachable_use:
-            missing.append(definition.id)
-        elif definition.id not in covered_defs:
-            missing.append(definition.id)
-    return missing
+    return [definition.id for definition in analysis.defs if definition.id not in covered_defs]
 
 
 def missing_all_p_some_c_obligations(

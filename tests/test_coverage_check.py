@@ -134,6 +134,25 @@ class CoverageParsingAndUtilityTests(unittest.TestCase):
 
         self.assertEqual(covered, [True, True])
 
+    def test_mcdc_treats_short_circuited_conditions_as_compatible(self) -> None:
+        decision = self.cov.DecisionInfo(
+            id=0,
+            line=1,
+            expression="a && b",
+            conditions=[
+                self.cov.ConditionInfo(0, 1, "a"),
+                self.cov.ConditionInfo(1, 1, "b"),
+            ],
+        )
+
+        # "0-" is a == 0 with b never evaluated; it pairs with "11" for a
+        # because the skipped condition cannot have influenced the outcome.
+        covered = self.cov.compute_mcdc(decision, [(0, "0-"), (1, "11"), (0, "10")])
+
+        self.assertEqual(covered, [True, True])
+        # Two unevaluated marks never demonstrate independence on their own.
+        self.assertEqual(self.cov.compute_mcdc(decision, [(0, "0-"), (1, "1-")]), [True, False])
+
     def test_write_case_template_uses_parameter_aware_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "cases.json"
@@ -221,6 +240,31 @@ class CoverageCliIntegrationTests(unittest.TestCase):
         self.assertIn("Function: absish(int x)", result.stdout)
         self.assertIn("Statement coverage: covered", result.stdout)
         self.assertIn("Branch coverage: covered", result.stdout)
+
+    def test_short_circuit_guard_is_preserved_by_instrumentation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            c_path = write_text(
+                tmp_path / "guard.c",
+                """
+                int h(int x) {
+                    if (x != 0 && 100 / x > 2) {
+                        return 1;
+                    }
+                    return 0;
+                }
+                """,
+            )
+            # x == 0 must not evaluate the division: the instrumented program
+            # has to keep C's short-circuit semantics instead of crashing.
+            cases = write_json(tmp_path / "cases.json", {"cases": [0, 10, 100]})
+
+            result = run_cli([COVERAGE_CHECK_SCRIPT, c_path, cases, "--json"], timeout=20)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        for criterion in ["statement", "branch", "decision", "condition", "mcdc"]:
+            self.assertTrue(report["coverage"][criterion]["covered"], criterion)
 
     def test_init_cases_cli_writes_template_and_exits(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

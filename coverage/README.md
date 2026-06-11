@@ -80,10 +80,14 @@ python3 coverage_check.py input.c cases.json --init-cases
 - The checker uses GCC and GNU C statement expressions for instrumentation.
 - Branch coverage tracks the true and false branches of each `if`, loop, and
   ternary predicate.
-- For condition and MC/DC tracking, each atomic condition in a decision is
-  evaluated to record its boolean value. Keep decision expressions free of side
-  effects such as `i++` if you want results to match the original short-circuit
-  behavior exactly.
+- Instrumentation preserves C's short-circuit evaluation: conditions the
+  original program would skip are not evaluated and not recorded, so guarded
+  predicates such as `x != 0 && 100 / x > 2` behave exactly as in the original
+  program. Skipped conditions appear as unevaluated in the MC/DC observations,
+  and MC/DC independence pairs treat them as compatible with any value, since
+  a skipped condition cannot have influenced the decision outcome.
+- MC/DC uses the unique-cause criterion: a pair must flip exactly one
+  evaluated condition together with the decision outcome.
 - `--json` prints a machine-readable report.
 - `--keep` leaves the generated instrumented C file in `.coverage_build`.
 
@@ -125,12 +129,14 @@ python3 data_flow_check.py input.c cases.json --keep
   occurrences in `if`, `while`, `for`, `do while`, `switch`, and ternary
   predicates. Boolean p-use outcomes are tracked as false/true.
 - Predicate instrumentation preserves normal C short-circuit evaluation for
-  variable occurrences.
+  variable occurrences. Assignments and `++`/`--` embedded inside expressions
+  record their definitions at the point of evaluation.
+- `switch` models the direct jump from the condition to every `case` label as
+  well as fallthrough between cases, and the no-`default` path around the body.
 - The static obligation set is based on may-reach definitions in the CFG, so it
   can include paths that are structurally possible but semantically infeasible.
-- Pointers, arrays, structs, `break`/`continue`-heavy control flow, and
-  side-effect-heavy predicate expressions are intentionally outside the simple
-  generic model.
+- Pointers, arrays, structs, and `break`/`continue`-heavy control flow are
+  intentionally outside the simple generic model.
 
 ## Test Case Suggestions
 
@@ -199,7 +205,13 @@ Useful knobs:
 --max-candidates 5000
 --max-additions 8
 --timeout 10
+--max-timeouts 25
 ```
+
+Each candidate runs in its own process with its own `--timeout`. A candidate
+input that crashes (for example a division by zero) or does not terminate is
+skipped and never suggested; after `--max-timeouts` timed-out candidates the
+remaining ones are no longer executed.
 
 ### Suggestion Limits
 

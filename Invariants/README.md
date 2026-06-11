@@ -22,6 +22,30 @@ python3 Invariants/invariant_classifier.py Invariants/input.c Invariants/invaria
 The bundled `input.c` contains:
 
 ```c
+void function(int x, int y) {
+    int i, j;
+    i = x ;
+    j = y ;
+    while ( i > 1) {
+        i = i / 2;
+        j = j * 2;
+    }
+}
+```
+
+The bundled `invariant.txt` contains:
+
+```text
+{i*j>0}
+```
+
+For that candidate, the tool reports `Not an invariant`: without a
+precondition on the inputs, the formula can already be false at the initial
+loop-head state (for example `x = -8, y = 5`).
+
+The worked example used in the rest of this README is:
+
+```c
 void function(int a, int b, int x, int y) {
     int tmp;
 
@@ -44,15 +68,10 @@ void function(int a, int b, int x, int y) {
 }
 ```
 
-The bundled `invariant.txt` contains:
-
-```text
-{(b > x) => (a > y)}
-```
-
-For that candidate, the tool reports `Non-inductive invariant`: the formula
-holds at all reachable loop-head states, but it is not preserved from every
-state satisfying only the candidate and the loop guard.
+For that program, the candidate `{(b > x) => (a > y)}` is classified as
+`Non-inductive invariant`: the formula holds at all reachable loop-head
+states, but it is not preserved from every state satisfying only the
+candidate and the loop guard.
 
 ## Requirements
 
@@ -101,7 +120,9 @@ pointers, structs, function calls, floating-point arithmetic, `break`,
 `continue`, and `return` before the target loop.
 
 Integer arithmetic is modeled as mathematical integer arithmetic. C overflow,
-machine integer widths, and undefined behavior are not modeled.
+machine integer widths, and undefined behavior are not modeled. Division and
+modulo follow C semantics (truncation toward zero, so `-7 / 2 == -3` and
+`-7 % 2 == -1`), not the SMT-LIB Euclidean definitions.
 
 ## Formula Files
 
