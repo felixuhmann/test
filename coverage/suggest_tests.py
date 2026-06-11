@@ -50,7 +50,9 @@ DATA_FLOW_CRITERIA = {
     "all-c-uses/some-p-uses",
     "all-p-uses/some-c-uses",
 }
-ALL_CRITERIA = sorted(DATA_FLOW_CRITERIA | {"mcdc"})
+CONTROL_FLOW_CRITERIA = {"decision", "condition", "condition/decision", "mcdc"}
+SIMPLE_CONTROL_FLOW_CRITERIA = {"decision", "condition", "condition/decision"}
+ALL_CRITERIA = sorted(DATA_FLOW_CRITERIA | CONTROL_FLOW_CRITERIA)
 
 
 @dataclass(frozen=True)
@@ -971,6 +973,103 @@ def solve_mcdc(
     return SuggestionResult("mcdc", False, selected_candidates, True, True, [], [])
 
 
+def solve_simple_control_flow(
+    criterion: str,
+    analysis: CoverageAnalyzer,
+    current_observations: list[MCDCObservation],
+    candidates: list[Candidate],
+    exact_target_limit: int,
+) -> SuggestionResult:
+    targets = simple_control_flow_targets(criterion, analysis)
+    current_features = control_flow_features_from_observations(criterion, current_observations)
+    missing_targets = sorted(targets - current_features)
+    if not missing_targets:
+        return SuggestionResult(criterion, True, [], True, True, [], [])
+
+    target_to_bit = {target: index for index, target in enumerate(missing_targets)}
+    full_mask = (1 << len(missing_targets)) - 1
+    candidate_masks: list[tuple[Candidate, int]] = []
+    union_mask = 0
+    for candidate in candidates:
+        features = control_flow_features_from_observations(criterion, candidate.observations)
+        mask = 0
+        for target in missing_targets:
+            if target in features:
+                mask |= 1 << target_to_bit[target]
+        if mask:
+            candidate_masks.append((candidate, mask))
+            union_mask |= mask
+
+    uncovered_by_domain = [
+        target
+        for target in missing_targets
+        if not (union_mask & (1 << target_to_bit[target]))
+    ]
+    if uncovered_by_domain:
+        return SuggestionResult(
+            criterion,
+            False,
+            [],
+            True,
+            False,
+            [describe_control_flow_target(analysis, target) for target in uncovered_by_domain],
+            generic_control_flow_hints(),
+        )
+
+    selected, exact = solve_set_cover(candidate_masks, full_mask, exact_target_limit)
+    if selected is None:
+        return SuggestionResult(
+            criterion,
+            False,
+            [],
+            False,
+            False,
+            [describe_control_flow_target(analysis, target) for target in missing_targets],
+            ["Increase --exact-target-limit or reduce the target domain with --domain."],
+        )
+
+    return SuggestionResult(criterion, False, selected, exact, True, [], [])
+
+
+def simple_control_flow_targets(criterion: str, analysis: CoverageAnalyzer) -> set[tuple[Any, ...]]:
+    if criterion not in SIMPLE_CONTROL_FLOW_CRITERIA:
+        raise ValueError(f"Unsupported simple control-flow criterion: {criterion}")
+
+    targets: set[tuple[Any, ...]] = set()
+    if criterion in {"decision", "condition/decision"}:
+        targets.update({
+            ("D", decision.id, outcome)
+            for decision in analysis.decisions
+            for outcome in (0, 1)
+        })
+    if criterion in {"condition", "condition/decision"}:
+        targets.update({
+            ("COND", decision.id, condition.id, outcome)
+            for decision in analysis.decisions
+            for condition in decision.conditions
+            for outcome in (0, 1)
+        })
+    return targets
+
+
+def control_flow_features_from_observations(
+    criterion: str,
+    observations: list[MCDCObservation] | tuple[MCDCObservation, ...],
+) -> set[tuple[Any, ...]]:
+    if criterion not in SIMPLE_CONTROL_FLOW_CRITERIA:
+        raise ValueError(f"Unsupported simple control-flow criterion: {criterion}")
+
+    features: set[tuple[Any, ...]] = set()
+    for observation in observations:
+        if criterion in {"decision", "condition/decision"}:
+            features.add(("D", observation.decision_id, observation.result))
+        if criterion in {"condition", "condition/decision"}:
+            for condition_id, bit in enumerate(observation.bits):
+                if bit in "01":
+                    features.add(("COND", observation.decision_id, condition_id, int(bit)))
+    return features
+
+
 def mcdc_covered_targets(analysis: CoverageAnalyzer, observations: list[MCDCObservation]) -> set[tuple[int, int]]:
     covered: set[tuple[int, int]] = set()
     by_decision: dict[int, list[tuple[int, str]]] = {}
@@ -1184,11 +1283,37 @@ def describe_mcdc_target(analysis: CoverageAnalyzer, target: tuple[int, int]) ->
     )
 
 
+def describe_control_flow_target(analysis: CoverageAnalyzer, target: tuple[Any, ...]) -> str:
+    if target[0] == "D":
+        _, decision_id, outcome = target
+        decision = analysis.decisions[decision_id]
+        return (
+            f"decision line {decision.line} `{decision.expression}` "
+            f"outcome {'true' if outcome else 'false'}"
+        )
+
+    _, decision_id, condition_id, outcome = target
+    decision = analysis.decisions[decision_id]
+    condition = decision.conditions[condition_id]
+    return (
+        f"condition line {condition.line} `{condition.expression}` "
+        f"value {'true' if outcome else 'false'} in decision `{decision.expression}`"
+    )
+
+
 def generic_data_flow_hints() -> list[str]:
     return [
         "No generated candidate exercised this obligation.",
         "The def-use path may be semantically infeasible, or the generated input domain may be too small.",
         "Try a custom --domain file with values that drive the missing branch or loop path.",
+    ]
+
+
+def generic_control_flow_hints() -> list[str]:
+    return [
+        "No generated candidate exercised this outcome.",
+        "The outcome may be infeasible, or the generated input domain may be too small.",
+        "Try a custom --domain file with values that drive the missing decision or condition value.",
     ]
 
 
@@ -1279,7 +1404,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-candidates", type=int, default=5000, help="Maximum generated candidate input cases.")
     parser.add_argument("--max-additions", type=int, default=8, help="Maximum cases to add for MC/DC pair search.")
     parser.add_argument("--max-search-nodes", type=int, default=250000, help="Maximum MC/DC recursive search nodes.")
-    parser.add_argument("--exact-target-limit", type=int, default=32, help="Use exact set cover up to this many missing data-flow targets.")
+    parser.add_argument("--exact-target-limit", type=int, default=32, help="Use exact set cover up to this many missing data-flow or simple control-flow targets.")
     parser.add_argument("--seed", type=int, default=1, help="Random seed used when candidate sampling is needed.")
     parser.add_argument("--timeout", type=float, default=10.0, help="Timeout in seconds per executed candidate case.")
     parser.add_argument("--max-timeouts", type=int, default=25, help="Stop executing candidates after this many timed-out cases.")
@@ -1329,13 +1454,22 @@ def main(argv: list[str] | None = None) -> int:
             keep=args.keep,
             max_timeouts=max(1, args.max_timeouts),
         )
-        result = solve_mcdc(
-            analysis=analysis,
-            current_observations=current_observations,
-            candidates=candidates,
-            max_additions=args.max_additions,
-            max_search_nodes=args.max_search_nodes,
-        )
+        if args.criterion in SIMPLE_CONTROL_FLOW_CRITERIA:
+            result = solve_simple_control_flow(
+                criterion=args.criterion,
+                analysis=analysis,
+                current_observations=current_observations,
+                candidates=candidates,
+                exact_target_limit=args.exact_target_limit,
+            )
+        else:
+            result = solve_mcdc(
+                analysis=analysis,
+                current_observations=current_observations,
+                candidates=candidates,
+                max_additions=args.max_additions,
+                max_search_nodes=args.max_search_nodes,
+            )
 
     if args.json:
         print(json.dumps(result_to_json(result, parameters, args.mode, len(candidate_cases)), indent=2))

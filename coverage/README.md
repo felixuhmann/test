@@ -79,15 +79,15 @@ python3 coverage_check.py input.c cases.json --init-cases
 - Parameters must be primitive values, with zero to five parameters supported.
 - The checker uses GCC and GNU C statement expressions for instrumentation.
 - Branch coverage tracks the true and false branches of each `if`, loop, and
-  ternary predicate.
+ternary predicate.
 - Instrumentation preserves C's short-circuit evaluation: conditions the
-  original program would skip are not evaluated and not recorded, so guarded
-  predicates such as `x != 0 && 100 / x > 2` behave exactly as in the original
-  program. Skipped conditions appear as unevaluated in the MC/DC observations,
-  and MC/DC independence pairs treat them as compatible with any value, since
-  a skipped condition cannot have influenced the decision outcome.
+original program would skip are not evaluated and not recorded, so guarded
+predicates such as `x != 0 && 100 / x > 2` behave exactly as in the original
+program. Skipped conditions appear as unevaluated in the MC/DC observations,
+and MC/DC independence pairs treat them as compatible with any value, since
+a skipped condition cannot have influenced the decision outcome.
 - MC/DC uses the unique-cause criterion: a pair must flip exactly one
-  evaluated condition together with the decision outcome.
+evaluated condition together with the decision outcome.
 - `--json` prints a machine-readable report.
 - `--keep` leaves the generated instrumented C file in `.coverage_build`.
 
@@ -124,19 +124,19 @@ python3 data_flow_check.py input.c cases.json --keep
 ### Data-Flow Notes
 
 - Parameters and primitive local variables are tracked by name. Avoid shadowing
-  local variables with the same name in nested scopes.
+local variables with the same name in nested scopes.
 - C-uses are ordinary computational expression uses. P-uses are variable
-  occurrences in `if`, `while`, `for`, `do while`, `switch`, and ternary
-  predicates. Boolean p-use outcomes are tracked as false/true.
+occurrences in `if`, `while`, `for`, `do while`, `switch`, and ternary
+predicates. Boolean p-use outcomes are tracked as false/true.
 - Predicate instrumentation preserves normal C short-circuit evaluation for
-  variable occurrences. Assignments and `++`/`--` embedded inside expressions
-  record their definitions at the point of evaluation.
+variable occurrences. Assignments and `++`/`--` embedded inside expressions
+record their definitions at the point of evaluation.
 - `switch` models the direct jump from the condition to every `case` label as
-  well as fallthrough between cases, and the no-`default` path around the body.
+well as fallthrough between cases, and the no-`default` path around the body.
 - The static obligation set is based on may-reach definitions in the CFG, so it
-  can include paths that are structurally possible but semantically infeasible.
+can include paths that are structurally possible but semantically infeasible.
 - Pointers, arrays, structs, and `break`/`continue`-heavy control flow are
-  intentionally outside the simple generic model.
+intentionally outside the simple generic model.
 
 ## Test Case Suggestions
 
@@ -161,11 +161,16 @@ all-p-uses
 all-uses
 all-c-uses/some-p-uses
 all-p-uses/some-c-uses
+decision
+condition
+condition/decision
 mcdc
 ```
 
 For suggestions, `all-uses` means all c-use obligations plus all p-use
-outcome obligations.
+outcome obligations. `decision`, `condition`, and `condition/decision` reuse
+the control-flow instrumentation and suggest cases that cover missing decision
+outcomes, condition values, or both at once.
 
 Examples:
 
@@ -173,6 +178,9 @@ Examples:
 python3 suggest_tests.py input.c cases.json --criterion all-p-uses
 python3 suggest_tests.py input.c cases.json --criterion all-uses
 python3 suggest_tests.py input.c cases.json --criterion all-c-uses --mode replace
+python3 suggest_tests.py input.c cases.json --criterion decision
+python3 suggest_tests.py input.c cases.json --criterion condition
+python3 suggest_tests.py input.c cases.json --criterion condition/decision
 python3 suggest_tests.py input.c cases.json --criterion mcdc --json
 ```
 
@@ -216,9 +224,10 @@ remaining ones are no longer executed.
 ### Suggestion Limits
 
 This is a bounded generator, not a complete symbolic prover. For data-flow
-criteria it solves an exact set-cover problem when the missing target count is
-small enough; otherwise it reports that the suite is a greedy approximation.
-For MC/DC it searches exact selector pairs over the generated candidate set.
+criteria and ordinary decision, condition, or condition/decision coverage it
+solves an exact set-cover problem when the missing target count is small
+enough; otherwise it reports that the suite is a greedy approximation. For
+MC/DC it searches exact selector pairs over the generated candidate set.
 
 If the script cannot satisfy a criterion, the report lists the still-missing
 obligations and hints whether the likely issue is an infeasible objective, a
@@ -229,7 +238,7 @@ logically coupled MC/DC condition, or a candidate domain that needs more values.
 Run:
 
 ```sh
-python3 kill_mutant.py original.c mutant.c
+python3 kill_mutant.py input.c mutant.c
 ```
 
 Both files must contain exactly one compatible C function: the same primitive

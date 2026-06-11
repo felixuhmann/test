@@ -1,12 +1,15 @@
-int multiply_modulo(long long a, long long b, long long mod) {
-    long long res = 0;
-    a = a % mod;
-    while (b != 0) {
-        if (b & 1) {
-            res = (res + a) % mod;
-        }
-        a = (a << 1) % mod;
-        b = b / 2;
+bool perfect(unsigned a) {
+    unsigned n = a;
+    if (n <= 1) {
+        return false;
     }
-    return res;
+
+    unsigned s = 1, i = n / 2;
+    while (i > 1) {
+        if (n% i == 0) {
+            s = s + 1;      
+        }
+        i = i - 1;
+    }
+    return s == n;
 }

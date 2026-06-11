@@ -26,6 +26,14 @@ class SuggestionUtilityTests(unittest.TestCase):
         self.assertIn("all-uses", self.suggest.DATA_FLOW_CRITERIA)
         self.assertIn("all-uses", self.suggest.ALL_CRITERIA)
 
+    def test_decision_and_condition_are_exposed_as_cli_criteria(self) -> None:
+        self.assertIn("decision", self.suggest.CONTROL_FLOW_CRITERIA)
+        self.assertIn("condition", self.suggest.CONTROL_FLOW_CRITERIA)
+        self.assertIn("condition/decision", self.suggest.CONTROL_FLOW_CRITERIA)
+        self.assertIn("decision", self.suggest.ALL_CRITERIA)
+        self.assertIn("condition", self.suggest.ALL_CRITERIA)
+        self.assertIn("condition/decision", self.suggest.ALL_CRITERIA)
+
     def test_default_domains_cover_common_primitive_values(self) -> None:
         self.assertEqual(self.suggest.default_domain("bool"), [False, True])
         self.assertEqual(self.suggest.default_domain("unsigned int")[:5], [0, 1, 2, 3, 4])
@@ -156,6 +164,122 @@ class SuggestionDataFlowObjectiveTests(unittest.TestCase):
 
 @unittest.skipUnless(require_gcc(), "gcc is required for suggestion CLI integration tests")
 class SuggestionCliIntegrationTests(unittest.TestCase):
+    def test_decision_json_suggests_cases_that_complete_a_partial_suite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            c_path = write_text(
+                tmp_path / "sign.c",
+                """
+                int sign(int x) {
+                    if (x > 0) {
+                        return 1;
+                    }
+                    return 0;
+                }
+                """,
+            )
+            cases = write_json(tmp_path / "cases.json", {"cases": [1]})
+
+            result = run_cli(
+                [
+                    SUGGEST_TESTS_SCRIPT,
+                    c_path,
+                    cases,
+                    "--criterion",
+                    "decision",
+                    "--json",
+                    "--values-per-param",
+                    "4",
+                    "--max-candidates",
+                    "20",
+                ],
+                timeout=25,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["criterion"], "decision")
+        self.assertTrue(payload["covered"])
+        self.assertTrue(any(case["inputs"]["x"] <= 0 for case in payload["suggested_cases"]))
+
+    def test_condition_json_suggests_cases_that_complete_a_partial_suite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            c_path = write_text(
+                tmp_path / "both.c",
+                """
+                int both(int a, int b) {
+                    if (a > 0 && b > 0) {
+                        return 1;
+                    }
+                    return 0;
+                }
+                """,
+            )
+            cases = write_json(tmp_path / "cases.json", {"cases": [[1, 1]]})
+
+            result = run_cli(
+                [
+                    SUGGEST_TESTS_SCRIPT,
+                    c_path,
+                    cases,
+                    "--criterion",
+                    "condition",
+                    "--json",
+                    "--values-per-param",
+                    "4",
+                    "--max-candidates",
+                    "30",
+                ],
+                timeout=25,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["criterion"], "condition")
+        self.assertTrue(payload["covered"])
+        self.assertTrue(any(case["inputs"]["a"] <= 0 for case in payload["suggested_cases"]))
+        self.assertTrue(any(case["inputs"]["a"] > 0 and case["inputs"]["b"] <= 0 for case in payload["suggested_cases"]))
+
+    def test_condition_decision_json_suggests_cases_that_complete_a_partial_suite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            c_path = write_text(
+                tmp_path / "both.c",
+                """
+                int both(int a, int b) {
+                    if (a > 0 && b > 0) {
+                        return 1;
+                    }
+                    return 0;
+                }
+                """,
+            )
+            cases = write_json(tmp_path / "cases.json", {"cases": [[1, 1]]})
+
+            result = run_cli(
+                [
+                    SUGGEST_TESTS_SCRIPT,
+                    c_path,
+                    cases,
+                    "--criterion",
+                    "condition/decision",
+                    "--json",
+                    "--values-per-param",
+                    "4",
+                    "--max-candidates",
+                    "30",
+                ],
+                timeout=25,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["criterion"], "condition/decision")
+        self.assertTrue(payload["covered"])
+        self.assertTrue(any(case["inputs"]["a"] <= 0 for case in payload["suggested_cases"]))
+        self.assertTrue(any(case["inputs"]["a"] > 0 and case["inputs"]["b"] <= 0 for case in payload["suggested_cases"]))
+
     def test_mcdc_json_suggests_cases_that_complete_a_partial_suite(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
